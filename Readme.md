@@ -317,11 +317,11 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the GPLv3 License - see the [LICENSE](LICENSE) file for details.
 
 ## Acknowledgments
 
-- Pimoroni for the Enviro+ Air HAT
+- Pimoroni for selling me the Enviro+ Air HAT
 - Raspberry Pi Foundation
 - Grafana Labs
 - MySQL/MariaDB communities
