@@ -67,7 +67,7 @@ sudo mysql_secure_installation
 ### 2. Clone Repository
 
 ```bash
-git clone https://github.com/yourusername/enviro-sensor-logger.git
+git clone https://github.com/maisie-the-cat/enviro-sensor-logger.git
 cd enviro-sensor-logger
 ```
 
