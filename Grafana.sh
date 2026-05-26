@@ -9,3 +9,12 @@ sudo apt-get install grafana
 # Start Grafana
 sudo systemctl start grafana-server
 sudo systemctl enable grafana-server
+
+# Install dependencies
+pip3 install mysql-connector-python bme280 pms5003 enviroplus smbus2 RPi.GPIO
+
+# Start Logging Data
+chmod +x sensor_logger.py
+python3 sensor_logger.py
+
+
