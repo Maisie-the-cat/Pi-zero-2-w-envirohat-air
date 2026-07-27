@@ -1,6 +1,6 @@
 # Enviro+ Air HAT Sensor Logger for Raspberry Pi Zero W
 
-A complete solution for continuously logging environmental sensor data from the Pimoroni Enviro+ Air HAT to a MySQL database, with Grafana visualization.
+A complete solution for continuously logging environmental sensor data from the Pimoroni Enviro+ Air HAT to a MySQL database, with Grafana visualization, Prometheus metrics, and async support.
 
 ## Table of Contents
 
@@ -11,21 +11,27 @@ A complete solution for continuously logging environmental sensor data from the 
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [Usage](#usage)
+- [Async Mode](#async-mode)
+- [Prometheus Metrics](#prometheus-metrics)
 - [Grafana Dashboard Setup](#grafana-dashboard-setup)
 - [Database Schema](#database-schema)
+- [API Endpoints](#api-endpoints)
 - [Troubleshooting](#troubleshooting)
 - [Contributing](#contributing)
 - [License](#license)
 
 ## Overview
 
-This project provides a Python-based data logger that continuously reads environmental sensor data from the Pimoroni Enviro+ Air HAT mounted on a Raspberry Pi Zero W and stores it in a MySQL database. The collected data can be visualized using Grafana dashboards for real-time monitoring and historical analysis.
+This project provides a Python-based data logger that continuously reads environmental sensor data from the Pimoroni Enviro+ Air HAT mounted on a Raspberry Pi Zero W and stores it in a MySQL database. The collected data can be visualized using Grafana dashboards for real-time monitoring and historical analysis. Additionally, it supports Prometheus metrics for monitoring the logger itself and async operation for improved performance.
 
 ## Features
 
 - **Continuous Monitoring**: Automatic periodic data collection from all Enviro+ sensors
 - **Multiple Sensors**: Supports BME280 (temperature, pressure, humidity), gas sensors (oxidising, reducing, NH3), particulate matter sensor (PM1, PM2.5, PM10), light sensor, and CPU temperature
 - **Robust Data Storage**: Reliable MySQL database storage with error handling, reconnection logic, and batch inserts
+- **Connection Pooling**: Efficient database connection management with configurable pool size
+- **Async Support**: Asynchronous operation for improved performance (optional)
+- **Prometheus Metrics**: Built-in metrics endpoint for monitoring the logger and sensor data
 - **Real-time Visualization**: Grafana integration for creating interactive dashboards
 - **Comprehensive Logging**: Detailed logging to file with rotation and console output for monitoring and debugging
 - **Automatic Recovery**: Handles transient errors and database disconnections gracefully
@@ -45,7 +51,8 @@ This project provides a Python-based data logger that continuously reads environ
 - Raspberry Pi OS (32-bit) with desktop
 - Python 3.7+
 - MySQL/MariaDB Server
-- Grafana
+- Grafana (optional, for visualization)
+- Prometheus (optional, for metrics collection)
 
 ## Installation
 
@@ -84,7 +91,7 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 4. Install Grafana
+### 4. Install Grafana (Optional)
 
 ```bash
 # Run the Grafana setup script
@@ -147,6 +154,18 @@ DB_NAME=sensor_data
 
 # Sensor Configuration (in seconds)
 READING_INTERVAL=60
+BATCH_SIZE=5
+
+# Connection Pooling Configuration
+CONNECTION_POOL_SIZE=5
+CONNECTION_POOL_NAME=sensor_pool
+
+# Async Configuration (experimental)
+USE_ASYNC=false
+
+# Prometheus Metrics Configuration
+ENABLE_PROMETHEUS=true
+PROMETHEUS_PORT=8000
 
 # Logging Configuration
 LOG_LEVEL=INFO
@@ -172,8 +191,17 @@ mysql -u sensor_user -p sensor_data < connectDB.sql
 # Activate virtual environment (if using one)
 source venv/bin/activate
 
-# Run the logger
+# Run the logger (sync mode, default)
 python3 logger.py
+
+# Run with async support
+USE_ASYNC=true python3 logger.py
+
+# Run with Prometheus metrics
+ENABLE_PROMETHEUS=true python3 logger.py
+
+# Run with both async and Prometheus
+USE_ASYNC=true ENABLE_PROMETHEUS=true python3 logger.py
 ```
 
 ### Running as a Service (Recommended)
@@ -195,7 +223,7 @@ After=network.target mysql.service
 Type=simple
 User=pi
 WorkingDirectory=/home/pi/Pi-zero-2-w-envirohat-air
-EnvironmentFile=/home/pi/Pi-zero-2-w-envirohat-air/.env
+EnvironmentFile=/etc/sensor-logger.env
 ExecStart=/home/pi/Pi-zero-2-w-envirohat-air/venv/bin/python /home/pi/Pi-zero-2-w-envirohat-air/logger.py
 Restart=always
 RestartSec=10
@@ -228,6 +256,107 @@ View logs:
 journalctl -u sensor-logger.service -f
 ```
 
+## Async Mode
+
+The logger supports asynchronous operation for improved performance. This is particularly useful when:
+- Reading from multiple sensors concurrently
+- Handling high-frequency data collection
+- Running on multi-core systems
+
+### Enable Async Mode
+
+Set `USE_ASYNC=true` in your `.env` file or environment:
+
+```bash
+USE_ASYNC=true python3 logger.py
+```
+
+### Async Features
+
+- Non-blocking sensor reads (using thread pool executor)
+- Asynchronous database operations
+- Improved throughput for batch operations
+- Better resource utilization
+
+**Note**: Async mode is experimental and requires Python 3.7+. The current implementation uses thread pool executors to wrap synchronous sensor libraries. Native async sensor libraries would provide better performance.
+
+## Prometheus Metrics
+
+The logger includes built-in Prometheus metrics for monitoring the application and sensor data.
+
+### Enable Prometheus
+
+Set `ENABLE_PROMETHEUS=true` in your `.env` file or environment:
+
+```bash
+ENABLE_PROMETHEUS=true python3 logger.py
+```
+
+The metrics server will start on port 8000 by default (configurable via `PROMETHEUS_PORT`).
+
+### Available Metrics
+
+#### Application Metrics
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `sensor_logger_info` | Info | Application version and configuration |
+| `sensor_readings_total` | Counter | Total sensor readings by type |
+| `sensor_readings_success_total` | Counter | Successful sensor readings |
+| `sensor_readings_failed_total` | Counter | Failed sensor readings |
+| `db_inserts_total` | Counter | Total database inserts |
+| `db_inserts_failed_total` | Counter | Failed database inserts |
+
+#### Sensor Value Metrics (Gauges)
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `sensor_temperature_celsius` | Gauge | Current temperature in °C |
+| `sensor_pressure_hpa` | Gauge | Current pressure in hPa |
+| `sensor_humidity_percent` | Gauge | Current humidity in % |
+| `sensor_light_lux` | Gauge | Current light level in lux |
+| `sensor_gas_oxidising` | Gauge | Current oxidising gas resistance |
+| `sensor_gas_reducing` | Gauge | Current reducing gas resistance |
+| `sensor_gas_nh3` | Gauge | Current NH3 gas resistance |
+| `sensor_pm1_ugm3` | Gauge | Current PM1.0 concentration |
+| `sensor_pm25_ugm3` | Gauge | Current PM2.5 concentration |
+| `sensor_pm10_ugm3` | Gauge | Current PM10 concentration |
+| `sensor_cpu_temperature_celsius` | Gauge | Current CPU temperature |
+
+### Prometheus Configuration
+
+Add the following to your `prometheus.yml`:
+
+```yaml
+scrape_configs:
+  - job_name: 'sensor_logger'
+    static_configs:
+      - targets: ['localhost:8000']
+    scrape_interval: 15s
+```
+
+### Example Queries
+
+**Check logger is running:**
+```promql
+up{job="sensor_logger"}
+```
+
+**Get current temperature:**
+```promql
+sensor_temperature_celsius
+```
+
+**Sensor reading success rate:**
+```promql
+rate(sensor_readings_success_total[5m]) / rate(sensor_readings_total[5m])
+```
+
+**Database insert rate:**
+```promql
+rate(db_inserts_total[5m])
+```
+
 ## Grafana Dashboard Setup
 
 ### 1. Access Grafana
@@ -241,7 +370,9 @@ Default credentials:
 - Username: `admin`
 - Password: `admin`
 
-### 2. Add MySQL Data Source
+### 2. Add Data Sources
+
+#### MySQL Data Source (for sensor data)
 
 1. Click on "Configuration" (gear icon) → "Data Sources"
 2. Click "Add data source"
@@ -254,60 +385,104 @@ Default credentials:
    - Password: `your_secure_password`
 5. Click "Save & Test"
 
+#### Prometheus Data Source (for logger metrics)
+
+1. Click on "Configuration" (gear icon) → "Data Sources"
+2. Click "Add data source"
+3. Select "Prometheus"
+4. Configure the connection:
+   - Name: `Logger Metrics`
+   - URL: `http://localhost:8000`
+5. Click "Save & Test"
+
 ### 3. Create Dashboard
 
 1. Click "+" → "Dashboard"
 2. Click "Add new panel"
 3. Configure panel settings:
-   - Data source: `Sensor Data`
-   - Query: 
-     ```sql
-     SELECT timestamp, temperature FROM sensor_readings ORDER BY timestamp DESC LIMIT 100
-     ```
-   - Visualization: Choose appropriate type (Graph, Gauge, etc.)
-4. Repeat for other sensor metrics
+   - Data source: `Sensor Data` (for sensor readings) or `Logger Metrics` (for application metrics)
+   - Query: See example queries below
+   - Visualization: Choose appropriate type (Graph, Gauge, Stat, etc.)
+4. Repeat for other metrics
 
 ### 4. Example Queries
 
-**Temperature over time:**
+**Sensor Data (MySQL):**
+
+Temperature over time:
 ```sql
 SELECT timestamp, temperature FROM sensor_readings ORDER BY timestamp DESC LIMIT 100
 ```
 
-**Humidity and Pressure:**
+Humidity and Pressure:
 ```sql
 SELECT timestamp, humidity, pressure FROM sensor_readings ORDER BY timestamp DESC LIMIT 100
 ```
 
-**Particulate Matter:**
+Particulate Matter:
 ```sql
 SELECT timestamp, pm1, pm25, pm10 FROM sensor_readings ORDER BY timestamp DESC LIMIT 100
 ```
 
-**All metrics:**
+All metrics:
 ```sql
 SELECT * FROM sensor_readings ORDER BY timestamp DESC LIMIT 100
+```
+
+**Logger Metrics (Prometheus):**
+
+Current temperature:
+```promql
+sensor_temperature_celsius
+```
+
+Reading success rate:
+```promql
+100 * (1 - (rate(sensor_readings_failed_total[5m]) / rate(sensor_readings_total[5m])))
+```
+
+Database operations:
+```promql
+rate(db_inserts_total[5m])
 ```
 
 ## Database Schema
 
 ### sensor_readings Table
 
-| Column      | Type         | Description                    |
-|-------------|--------------|--------------------------------|
-| id          | INT          | Auto-increment primary key     |
-| timestamp   | DATETIME     | Reading timestamp              |
-| temperature | FLOAT        | Temperature in °C              |
-| pressure    | FLOAT        | Pressure in hPa                |
-| humidity    | FLOAT        | Relative humidity in %         |
-| light       | FLOAT        | Light level (lux)              |
-| oxidised    | FLOAT        | Oxidising gas resistance       |
-| reduced     | FLOAT        | Reducing gas resistance        |
-| nh3         | FLOAT        | NH3 gas resistance             |
-| pm1         | FLOAT        | PM1.0 concentration (µg/m³)    |
-| pm25        | FLOAT        | PM2.5 concentration (µg/m³)    |
-| pm10        | FLOAT        | PM10 concentration (µg/m³)     |
-| cpu_temp    | FLOAT        | CPU temperature in °C          |
+| Column | Type | Description |
+|--------|------|-------------|
+| id | INT | Auto-increment primary key |
+| timestamp | DATETIME | Reading timestamp |
+| temperature | FLOAT | Temperature in °C |
+| pressure | FLOAT | Pressure in hPa |
+| humidity | FLOAT | Relative humidity in % |
+| light | FLOAT | Light level (lux) |
+| oxidised | FLOAT | Oxidising gas resistance |
+| reduced | FLOAT | Reducing gas resistance |
+| nh3 | FLOAT | NH3 gas resistance |
+| pm1 | FLOAT | PM1.0 concentration (µg/m³) |
+| pm25 | FLOAT | PM2.5 concentration (µg/m³) |
+| pm10 | FLOAT | PM10 concentration (µg/m³) |
+| cpu_temp | FLOAT | CPU temperature in °C |
+
+## API Endpoints
+
+When Prometheus metrics are enabled, the following endpoint is available:
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/metrics` | GET | Prometheus metrics in text format |
+
+### Example Usage
+
+```bash
+# Get metrics
+curl http://localhost:8000/metrics
+
+# Get specific metric
+curl http://localhost:8000/metrics | grep sensor_temperature
+```
 
 ## Troubleshooting
 
@@ -325,17 +500,32 @@ SELECT * FROM sensor_readings ORDER BY timestamp DESC LIMIT 100
    - Ensure database and user exist
    - Test connection manually: `mysql -u sensor_user -p sensor_data`
 
-3. **Permission Errors**
+3. **Connection Pool Errors**
+   - Check pool size is not too large for your system
+   - Verify MySQL max_connections setting is higher than pool size
+   - Restart MySQL service: `sudo systemctl restart mariadb`
+
+4. **Prometheus Not Accessible**
+   - Check if port is in use: `ss -tulnp | grep 8000`
+   - Verify firewall settings: `sudo ufw allow 8000`
+   - Check if Prometheus is enabled: `ENABLE_PROMETHEUS=true`
+
+5. **Async Mode Issues**
+   - Ensure Python 3.7+ is installed
+   - Try running in sync mode first: `USE_ASYNC=false`
+   - Check for any blocking operations
+
+6. **Permission Errors**
    - Run with appropriate user permissions
    - Check file permissions: `ls -la sensor_logger.log`
    - Ensure the user running the script has write access to the directory
 
-4. **Grafana Not Accessible**
+7. **Grafana Not Accessible**
    - Check Grafana service: `sudo systemctl status grafana-server`
    - Verify firewall settings: `sudo ufw allow 3000`
    - Check if Grafana is listening: `ss -tulnp | grep 3000`
 
-5. **Python Module Import Errors**
+8. **Python Module Import Errors**
    - Ensure you're using the virtual environment: `source venv/bin/activate`
    - Reinstall dependencies: `pip install -r requirements.txt`
    - Check Python version: `python3 --version`
@@ -345,6 +535,7 @@ SELECT * FROM sensor_readings ORDER BY timestamp DESC LIMIT 100
 - Application logs: `sensor_logger.log` (rotated automatically)
 - System logs: `journalctl -u sensor-logger.service`
 - MySQL logs: `/var/log/mysql/error.log`
+- Prometheus logs: Check the console output when starting the logger
 
 ### Debug Mode
 
@@ -385,3 +576,4 @@ This project is licensed under the GPLv3 License - see the [LICENSE](LICENSE) fi
 - Raspberry Pi Foundation
 - Grafana Labs
 - MySQL/MariaDB communities
+- Prometheus community
