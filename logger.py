@@ -11,11 +11,11 @@ import signal
 import sys
 import logging
 import asyncio
+import socket
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
 from dotenv import load_dotenv
 from prometheus_client import start_http_server, Gauge, Counter, Info
-# import mysql.connector
 from mysql.connector import pooling, Error
 
 # Load environment variables
@@ -37,6 +37,8 @@ DEFAULT_SENSOR_VALUE = 0.0
 PMS_TIMEOUT_SECONDS = 5
 SENSOR_RETRY_ATTEMPTS = 3
 RETRY_DELAY_SECONDS = 10
+DB_RETRY_ATTEMPTS = 5
+DB_RETRY_DELAY = 5  # seconds
 CONNECTION_POOL_SIZE = 5
 CONNECTION_POOL_NAME = 'sensor_pool'
 
@@ -82,16 +84,46 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+class DatabaseConfigError(ValueError):
+    """Raised when database configuration is invalid"""
+    pass
+
+
+class SensorInitializationError(RuntimeError):
+    """Raised when sensor initialization fails"""
+    pass
+
+
+class DatabaseConnectionError(RuntimeError):
+    """Raised when database connection fails"""
+    pass
+
+
 # Database configuration from environment variables
-DB_CONFIG = {
-    'host': os.getenv('DB_HOST', DEFAULT_DB_HOST),
-    'user': os.getenv('DB_USER', DEFAULT_DB_USER),
-    'password': os.getenv('DB_PASSWORD', ''),
-    'database': os.getenv('DB_NAME', DEFAULT_DB_NAME),
-    'pool_name': CONNECTION_POOL_NAME,
-    'pool_size': int(os.getenv('CONNECTION_POOL_SIZE', str(CONNECTION_POOL_SIZE))),
-    'pool_reset_session': True
-}
+def get_db_config():
+    """Get and validate database configuration"""
+    config = {
+        'host': os.getenv('DB_HOST', DEFAULT_DB_HOST),
+        'user': os.getenv('DB_USER', DEFAULT_DB_USER),
+        'password': os.getenv('DB_PASSWORD', ''),
+        'database': os.getenv('DB_NAME', DEFAULT_DB_NAME),
+        'pool_name': CONNECTION_POOL_NAME,
+        'pool_size': int(os.getenv('CONNECTION_POOL_SIZE', str(CONNECTION_POOL_SIZE))),
+        'pool_reset_session': True
+    }
+    
+    # Validate required fields (password can be empty for password-less auth)
+    required_fields = ['host', 'user', 'database']
+    missing = [field for field in required_fields if not config[field]]
+    
+    if missing:
+        logger.error(f"Missing database configuration for: {', '.join(missing)}")
+        logger.error("Please set environment variables: DB_HOST, DB_USER, DB_NAME")
+        raise DatabaseConfigError(f"Missing required database configuration: {', '.join(missing)}")
+    
+    return config
+
 
 # Sensor reading interval in seconds
 READING_INTERVAL = int(os.getenv('READING_INTERVAL', str(DEFAULT_READING_INTERVAL)))
@@ -118,6 +150,10 @@ DB_INSERTS_FAILED = Counter(
     'db_inserts_failed_total',
     'Total number of failed database inserts'
 )
+DB_CONNECTION_RETRIES = Counter(
+    'db_connection_retries_total',
+    'Total number of database connection retries'
+)
 SENSOR_VALUE_GAUGES = {
     'temperature': Gauge('sensor_temperature_celsius', 'Temperature in °C'),
     'pressure': Gauge('sensor_pressure_hpa', 'Pressure in hPa'),
@@ -132,6 +168,26 @@ SENSOR_VALUE_GAUGES = {
     'cpu_temp': Gauge('sensor_cpu_temperature_celsius', 'CPU temperature in °C')
 }
 APP_INFO = Info('sensor_logger_info', 'Sensor Logger Application Information')
+HEALTH_CHECK = Gauge('sensor_logger_health', 'Application health status (1=healthy, 0=unhealthy)')
+
+
+def is_port_available(port, host='0.0.0.0'):
+    """Check if a port is available"""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind((host, port))
+            return True
+    except (OSError, socket.error):
+        return False
+
+
+def find_available_port(start_port, max_attempts=10):
+    """Find an available port starting from start_port"""
+    for i in range(max_attempts):
+        port = start_port + i
+        if is_port_available(port):
+            return port
+    return None
 
 
 class EnviroSensorLogger:
@@ -143,16 +199,18 @@ class EnviroSensorLogger:
         self.use_async = use_async
         self.enable_prometheus = enable_prometheus
         self.running = False
+        self.sensors_initialized = False
+        self.async_loop = None
 
         # Set application info
         APP_INFO.info({
-            'version': '1.0.0',
+            'version': '1.1.0',
             'use_async': str(use_async),
             'enable_prometheus': str(enable_prometheus)
         })
 
-        self.setup_sensors()
-        self.setup_database()
+        # Initialize health check
+        HEALTH_CHECK.set(1)
 
         # Register signal handlers
         signal.signal(signal.SIGTERM, self.shutdown)
@@ -161,39 +219,79 @@ class EnviroSensorLogger:
     def shutdown(self, signum, frame):
         """Handle graceful shutdown"""
         logger.info(f"Received signal {signum}. Shutting down gracefully...")
+        HEALTH_CHECK.set(0)
         self.running = False
-        if self.db_pool:
+        
+        # Flush any remaining data
+        if self.batch_data:
+            logger.info(LOG_FLUSHING_DATA)
             try:
-                if self.batch_data:
-                    self._insert_batch()
+                if self.use_async and self.async_loop:
+                    asyncio.run_coroutine_threadsafe(self.flush_batch_async(), self.async_loop)
+                else:
+                    self.flush_batch()
+            except Exception as e:
+                logger.error(f"Error flushing batch on shutdown: {e}")
+        
+        # Close database connections
+        self.close_database_connections()
+        
+        logger.info(LOG_DB_CLOSED)
+        sys.exit(0)
+
+    def close_database_connections(self):
+        """Close all database connections safely"""
+        try:
+            if self.db_pool:
                 self.db_pool.close()
                 self.db_pool = None
-                logger.info(LOG_DB_CLOSED)
-            except Error as e:
-                logger.error(f"Error closing connection pool: {e}")
-        elif self.db_connection and self.db_connection.is_connected():
-            try:
-                if self.batch_data:
-                    self._insert_batch()
+            elif self.db_connection and self.db_connection.is_connected():
                 self.db_connection.close()
-                logger.info(LOG_DB_CLOSED)
-            except Error as e:
-                logger.error(f"Error closing database connection: {e}")
-        sys.exit(0)
+                self.db_connection = None
+        except Error as e:
+            logger.error(f"Error closing database connections: {e}")
 
     def setup_sensors(self, retry_count=0):
         """Initialize all Enviro+ Air HAT sensors"""
+        if self.sensors_initialized:
+            return
+            
         try:
-            # Import sensor libraries
-            import bme280
-            import pms5003
-            from enviroplus import gas, light
+            # Import sensor libraries with fallbacks
+            try:
+                import bme280
+                self.bme280_sensor = bme280.BME280()
+            except ImportError:
+                try:
+                    from bme280 import BME280
+                    self.bme280_sensor = BME280()
+                except ImportError as e:
+                    raise ImportError(f"bme280 library not found: {e}")
 
-            self.bme280_sensor = bme280.BME280()
-            self.pms_sensor = pms5003.PMS5003()
-            self.gas_sensor = gas
-            self.light_sensor = light
+            # Try different PMS5003 imports
+            try:
+                import pms5003
+                self.pms_sensor = pms5003.PMS5003()
+            except ImportError:
+                try:
+                    from pms5003 import PMS5003
+                    self.pms_sensor = PMS5003()
+                except ImportError:
+                    try:
+                        import pimoroni_pms5003 as pms5003
+                        self.pms_sensor = pms5003.PMS5003()
+                    except ImportError as e:
+                        raise ImportError(f"PMS5003 library not found: {e}")
 
+            # Import gas and light sensors
+            try:
+                from enviroplus import gas, light
+                self.gas_sensor = gas
+                self.light_sensor = light
+            except ImportError as e:
+                raise ImportError(f"enviroplus library not found: {e}")
+
+            self.sensors_initialized = True
             logger.info(LOG_SENSORS_INITIALIZED)
 
         except ImportError as e:
@@ -204,7 +302,8 @@ class EnviroSensorLogger:
                 self.setup_sensors(retry_count + 1)
             else:
                 logger.critical("Failed to initialize sensors after 3 attempts. Exiting.")
-                raise
+                HEALTH_CHECK.set(0)
+                raise SensorInitializationError("Failed to initialize sensors")
 
     def install_sensor_libraries(self):
         """Install required sensor libraries"""
@@ -220,30 +319,27 @@ class EnviroSensorLogger:
 
         for lib in libraries:
             try:
-                subprocess.check_call([sys.executable, '-m', 'pip', 'install', lib])
+                subprocess.check_call([sys.executable, '-m', 'pip', 'install', lib], 
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 logger.info(f"Successfully installed {lib}")
             except subprocess.CalledProcessError as e:
                 logger.error(f"Failed to install {lib}: {e}")
 
-    def setup_database(self):
-        """Establish database connection with pooling"""
+    def setup_database(self, retry_count=0):
+        """Establish database connection with pooling and retry logic"""
         try:
-            # Validate DB_CONFIG
-            if not all([DB_CONFIG['host'], DB_CONFIG['user'], DB_CONFIG['password'], DB_CONFIG['database']]):
-                missing = [k for k, v in DB_CONFIG.items() if k not in ['pool_name', 'pool_size'] and not v]
-                logger.error(f"Missing database configuration for: {', '.join(missing)}")
-                logger.error("Please set environment variables: DB_HOST, DB_USER, DB_PASSWORD, DB_NAME")
-                raise ValueError("Incomplete database configuration")
+            DB_CONFIG = get_db_config()
 
             if self.use_async:
-                # For async, we'll use the pool in async context
+                # For async mode, use connection pooling
                 self.db_pool = pooling.MySQLConnectionPool(
                     pool_name=DB_CONFIG['pool_name'],
                     pool_size=DB_CONFIG['pool_size'],
                     **{k: v for k, v in DB_CONFIG.items() if k not in ['pool_name', 'pool_size']}
                 )
+                self.db_connection = None
             else:
-                # For sync, use connection pooling
+                # For sync mode, use connection pooling
                 self.db_pool = pooling.MySQLConnectionPool(
                     pool_name=DB_CONFIG['pool_name'],
                     pool_size=DB_CONFIG['pool_size'],
@@ -254,14 +350,32 @@ class EnviroSensorLogger:
 
             logger.info(LOG_DB_CONNECTED)
             self.create_table_if_not_exists()
+            HEALTH_CHECK.set(1)
+
         except Error as e:
-            logger.error(f"Database connection error: {e}")
-            raise
+            logger.error(f"Database connection error (attempt {retry_count + 1}): {e}")
+            DB_CONNECTION_RETRIES.inc()
+            
+            if retry_count < DB_RETRY_ATTEMPTS:
+                delay = DB_RETRY_DELAY * (2 ** retry_count)  # Exponential backoff
+                logger.info(f"Retrying database connection in {delay} seconds...")
+                time.sleep(delay)
+                self.setup_database(retry_count + 1)
+            else:
+                logger.critical(f"Failed to connect to database after {DB_RETRY_ATTEMPTS} attempts")
+                HEALTH_CHECK.set(0)
+                raise DatabaseConnectionError(f"Failed to connect to database: {e}")
 
     def get_db_connection(self):
         """Get a connection from the pool"""
         if self.db_pool:
-            return self.db_pool.get_connection()
+            try:
+                return self.db_pool.get_connection()
+            except Error as e:
+                logger.error(f"Error getting connection from pool: {e}")
+                # Try to reconnect
+                self.setup_database()
+                return self.get_db_connection()
         elif self.db_connection and self.db_connection.is_connected():
             return self.db_connection
         else:
@@ -288,7 +402,10 @@ class EnviroSensorLogger:
                     pm25 FLOAT,
                     pm10 FLOAT,
                     cpu_temp FLOAT,
-                    INDEX idx_timestamp (timestamp)
+                    INDEX idx_timestamp (timestamp),
+                    INDEX idx_temperature (temperature),
+                    INDEX idx_humidity (humidity),
+                    INDEX idx_pressure (pressure)
                 )
             """)
             conn.commit()
@@ -313,12 +430,20 @@ class EnviroSensorLogger:
                 min_val, max_val = SENSOR_RANGES[key]
                 if not (min_val <= value <= max_val):
                     logger.warning(f"{key} out of range: {value} (expected {min_val}-{max_val})")
-                    return False
+                    # Don't fail, just clamp to range
+                    data[key] = max(min_val, min(value, max_val))
 
         return True
 
     def read_sensors(self):
         """Read all sensor data"""
+        if not self.sensors_initialized:
+            self.setup_sensors()
+            if not self.sensors_initialized:
+                logger.error("Sensors not initialized")
+                SENSOR_READINGS_FAILED.inc()
+                return None
+
         try:
             # Read BME280 (temperature, pressure, humidity)
             temperature = self.bme280_sensor.get_temperature()
@@ -384,6 +509,7 @@ class EnviroSensorLogger:
         except Exception as e:
             logger.error(f"Error reading sensors: {e}")
             SENSOR_READINGS_FAILED.inc()
+            HEALTH_CHECK.set(0)
             return None
 
     def get_cpu_temperature(self):
@@ -446,6 +572,7 @@ class EnviroSensorLogger:
         except Error as e:
             logger.error(f"Batch database error: {e}")
             DB_INSERTS_FAILED.inc(len(self.batch_data))
+            HEALTH_CHECK.set(0)
             if conn and conn.is_connected():
                 conn.rollback()
             # Try to reconnect
@@ -472,6 +599,7 @@ class EnviroSensorLogger:
         except Error as e:
             logger.error(f"Database error: {e}")
             DB_INSERTS_FAILED.inc()
+            HEALTH_CHECK.set(0)
             self.setup_database()
             return False
 
@@ -482,9 +610,7 @@ class EnviroSensorLogger:
         return True
 
     async def read_sensors_async(self):
-        """Async version of read_sensors (placeholder for async sensor libraries)"""
-        # For now, wrap sync calls in executor
-        # In the future, use native async sensor libraries
+        """Async version of read_sensors"""
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, self.read_sensors)
 
@@ -502,13 +628,26 @@ class EnviroSensorLogger:
         """Main loop to continuously log sensor data"""
         logger.info(LOG_STARTING_ASYNC if self.use_async else "Starting Enviro+ Air HAT sensor logger...")
         logger.info(f"Reading interval: {READING_INTERVAL} seconds")
-        logger.info(f"Connection pooling: enabled with {DB_CONFIG['pool_size']} connections")
+        logger.info(f"Connection pooling: enabled with {get_db_config()['pool_size']} connections")
 
         # Start Prometheus server if enabled
         if self.enable_prometheus:
             prometheus_port = int(os.getenv('PROMETHEUS_PORT', str(DEFAULT_PROMETHEUS_PORT)))
-            start_http_server(prometheus_port)
-            logger.info(f"{LOG_STARTING_PROMETHEUS} on port {prometheus_port}")
+            
+            # Check if port is available, find alternative if not
+            if not is_port_available(prometheus_port):
+                logger.warning(f"Port {prometheus_port} is not available, finding alternative...")
+                alt_port = find_available_port(prometheus_port)
+                if alt_port:
+                    prometheus_port = alt_port
+                    logger.info(f"Using alternative Prometheus port: {prometheus_port}")
+                else:
+                    logger.error("No available port found for Prometheus, disabling metrics")
+                    self.enable_prometheus = False
+            
+            if self.enable_prometheus:
+                start_http_server(prometheus_port)
+                logger.info(f"{LOG_STARTING_PROMETHEUS} on port {prometheus_port}")
 
         self.running = True
 
@@ -523,19 +662,9 @@ class EnviroSensorLogger:
             # Clean up
             self.running = False
             logger.info(LOG_FLUSHING_DATA)
-            if self.use_async:
-                loop = asyncio.get_event_loop()
-                loop.run_until_complete(self.flush_batch_async())
-                loop.close()
-            else:
-                self.flush_batch()
-
-            if self.db_pool:
-                self.db_pool.close()
-                logger.info(LOG_DB_CLOSED)
-            elif self.db_connection and self.db_connection.is_connected():
-                self.db_connection.close()
-                logger.info(LOG_DB_CLOSED)
+            self.flush_batch()
+            self.close_database_connections()
+            HEALTH_CHECK.set(0)
 
     def _run_sync(self):
         """Synchronous main loop"""
@@ -558,6 +687,7 @@ class EnviroSensorLogger:
                     break
                 except Exception as e:
                     logger.error(f"Unexpected error: {e}")
+                    HEALTH_CHECK.set(0)
                     time.sleep(RETRY_DELAY_SECONDS)
         except KeyboardInterrupt:
             self.running = False
@@ -580,17 +710,25 @@ class EnviroSensorLogger:
                 except KeyboardInterrupt:
                     logger.info("Stopping async sensor logger...")
                     self.running = False
+                except asyncio.CancelledError:
+                    logger.info("Async loop cancelled")
+                    self.running = False
                 except Exception as e:
                     logger.error(f"Unexpected async error: {e}")
+                    HEALTH_CHECK.set(0)
                     await asyncio.sleep(RETRY_DELAY_SECONDS)
 
-        loop = asyncio.get_event_loop()
+        self.async_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.async_loop)
+        
         try:
-            loop.run_until_complete(async_loop())
+            self.async_loop.run_until_complete(async_loop())
         except KeyboardInterrupt:
             pass
         finally:
-            loop.close()
+            if self.async_loop:
+                self.async_loop.close()
+                self.async_loop = None
 
 
 def create_async_logger():
@@ -602,8 +740,14 @@ def create_async_logger():
 
 if __name__ == "__main__":
     try:
+        # Check if .env file exists
+        if not os.path.exists('.env'):
+            logger.warning(".env file not found. Using environment variables or defaults.")
+            logger.warning("Create a .env file from .env.example for configuration.")
+        
         sensor_logger = create_async_logger()
         sensor_logger.run()
     except Exception as e:
         logger.critical(f"Fatal error: {e}")
+        HEALTH_CHECK.set(0)
         sys.exit(1)

@@ -1,0 +1,31 @@
+[Unit]
+Description=Enviro+ Air HAT Sensor Logger
+After=network.target mysql.service mariadb.service
+Wants=network.target mysql.service mariadb.service
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/Pi-zero-2-w-envirohat-air
+
+# Environment variables (create /etc/sensor-logger.env with actual values)
+EnvironmentFile=/etc/sensor-logger.env
+
+# Use the virtual environment Python
+ExecStart=/home/pi/Pi-zero-2-w-envirohat-air/venv/bin/python /home/pi/Pi-zero-2-w-envirohat-air/logger.py
+
+# Restart configuration
+Restart=always
+RestartSec=10
+
+# Process management
+TimeoutStopSec=30
+KillMode=process
+
+# Security
+PrivateTmp=true
+ProtectSystem=full
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
