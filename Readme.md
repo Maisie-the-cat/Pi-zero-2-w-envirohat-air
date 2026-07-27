@@ -24,11 +24,13 @@ This project provides a Python-based data logger that continuously reads environ
 ## Features
 
 - **Continuous Monitoring**: Automatic periodic data collection from all Enviro+ sensors
-- **Multiple Sensors**: Supports BME280 (temperature, pressure, humidity), gas sensors (oxidising, reducing, NH3), particulate matter sensor (PM1, PM2.5, PM10), and CPU temperature
-- **Robust Data Storage**: Reliable MySQL database storage with error handling and reconnection logic
+- **Multiple Sensors**: Supports BME280 (temperature, pressure, humidity), gas sensors (oxidising, reducing, NH3), particulate matter sensor (PM1, PM2.5, PM10), light sensor, and CPU temperature
+- **Robust Data Storage**: Reliable MySQL database storage with error handling, reconnection logic, and batch inserts
 - **Real-time Visualization**: Grafana integration for creating interactive dashboards
-- **Comprehensive Logging**: Detailed logging to file and console for monitoring and debugging
+- **Comprehensive Logging**: Detailed logging to file with rotation and console output for monitoring and debugging
 - **Automatic Recovery**: Handles transient errors and database disconnections gracefully
+- **Configuration Management**: Environment variables for secure credential management
+- **Graceful Shutdown**: Proper cleanup on SIGTERM/SIGINT signals
 
 ## Hardware Requirements
 
@@ -55,7 +57,7 @@ sudo apt-get update
 sudo apt-get upgrade
 
 # Install Python and pip
-sudo apt-get install python3 python3-pip
+sudo apt-get install python3 python3-pip python3-venv
 
 # Install MySQL Server
 sudo apt-get install mariadb-server
@@ -67,17 +69,30 @@ sudo mysql_secure_installation
 ### 2. Clone Repository
 
 ```bash
-git clone https://github.com/maisie-the-cat/enviro-sensor-logger.git
-cd enviro-sensor-logger
+git clone https://github.com/Maisie-the-cat/Pi-zero-2-w-envirohat-air.git
+cd Pi-zero-2-w-envirohat-air
 ```
 
 ### 3. Install Python Dependencies
 
 ```bash
-pip3 install -r requirements.txt
+# Create virtual environment (recommended)
+python3 -m venv venv
+source venv/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt
 ```
 
 ### 4. Install Grafana
+
+```bash
+# Run the Grafana setup script
+chmod +x Grafana.sh
+./Grafana.sh
+```
+
+Or manually:
 
 ```bash
 # Add Grafana repository
@@ -110,43 +125,43 @@ CREATE DATABASE sensor_data;
 CREATE USER 'sensor_user'@'localhost' IDENTIFIED BY 'your_secure_password';
 GRANT ALL PRIVILEGES ON sensor_data.* TO 'sensor_user'@'localhost';
 FLUSH PRIVILEGES;
-
--- Create table
-USE sensor_data;
-
-CREATE TABLE sensor_readings (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-    temperature FLOAT,
-    pressure FLOAT,
-    humidity FLOAT,
-    light FLOAT,
-    oxidised FLOAT,
-    reduced FLOAT,
-    nh3 FLOAT,
-    pm1 FLOAT,
-    pm25 FLOAT,
-    pm10 FLOAT,
-    cpu_temp FLOAT,
-    INDEX idx_timestamp (timestamp)
-);
 ```
 
 ### 2. Application Configuration
 
-Edit the `sensor_logger.py` file to update database credentials:
+Copy the example environment file and edit it:
 
-```python
-# Database configuration
-DB_CONFIG = {
-    'host': 'localhost',
-    'user': 'sensor_user',
-    'password': 'your_secure_password',
-    'database': 'sensor_data'
-}
+```bash
+cp .env.example .env
+nano .env
+```
 
-# Sensor reading interval in seconds
-READING_INTERVAL = 60  # 1 minute
+Edit the `.env` file with your configuration:
+
+```ini
+# Database Configuration
+DB_HOST=localhost
+DB_USER=sensor_user
+DB_PASSWORD=your_secure_password
+DB_NAME=sensor_data
+
+# Sensor Configuration (in seconds)
+READING_INTERVAL=60
+
+# Logging Configuration
+LOG_LEVEL=INFO
+LOG_MAX_BYTES=5242880
+LOG_BACKUP_COUNT=3
+```
+
+**Important**: Never commit your `.env` file to version control. It is already excluded via `.gitignore`.
+
+### 3. Create Database Table
+
+The logger will automatically create the required table on first run. Alternatively, you can create it manually:
+
+```bash
+mysql -u sensor_user -p sensor_data < connectDB.sql
 ```
 
 ## Usage
@@ -154,14 +169,14 @@ READING_INTERVAL = 60  # 1 minute
 ### Running the Logger
 
 ```bash
-# Make script executable
-chmod +x sensor_logger.py
+# Activate virtual environment (if using one)
+source venv/bin/activate
 
 # Run the logger
-python3 sensor_logger.py
+python3 logger.py
 ```
 
-### Running as a Service (Optional)
+### Running as a Service (Recommended)
 
 Create a systemd service file:
 
@@ -169,7 +184,7 @@ Create a systemd service file:
 sudo nano /etc/systemd/system/sensor-logger.service
 ```
 
-Add the following content:
+Add the following content (update paths as needed):
 
 ```ini
 [Unit]
@@ -179,14 +194,19 @@ After=network.target mysql.service
 [Service]
 Type=simple
 User=pi
-WorkingDirectory=/home/pi/enviro-sensor-logger
-ExecStart=/usr/bin/python3 /home/pi/enviro-sensor-logger/sensor_logger.py
+WorkingDirectory=/home/pi/Pi-zero-2-w-envirohat-air
+EnvironmentFile=/home/pi/Pi-zero-2-w-envirohat-air/.env
+ExecStart=/home/pi/Pi-zero-2-w-envirohat-air/venv/bin/python /home/pi/Pi-zero-2-w-envirohat-air/logger.py
 Restart=always
 RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
 ```
+
+**Note**: For environment variables to work with systemd, you need to:
+1. Create a separate environment file (e.g., `/etc/sensor-logger.env`) with the same content as `.env`
+2. Update the service file to point to it: `EnvironmentFile=/etc/sensor-logger.env`
 
 Enable and start the service:
 
@@ -200,6 +220,12 @@ Check service status:
 
 ```bash
 sudo systemctl status sensor-logger.service
+```
+
+View logs:
+
+```bash
+journalctl -u sensor-logger.service -f
 ```
 
 ## Grafana Dashboard Setup
@@ -258,6 +284,11 @@ SELECT timestamp, humidity, pressure FROM sensor_readings ORDER BY timestamp DES
 SELECT timestamp, pm1, pm25, pm10 FROM sensor_readings ORDER BY timestamp DESC LIMIT 100
 ```
 
+**All metrics:**
+```sql
+SELECT * FROM sensor_readings ORDER BY timestamp DESC LIMIT 100
+```
+
 ## Database Schema
 
 ### sensor_readings Table
@@ -286,24 +317,53 @@ SELECT timestamp, pm1, pm25, pm10 FROM sensor_readings ORDER BY timestamp DESC L
    - Ensure Enviro+ Air HAT is properly seated
    - Check I2C is enabled: `sudo raspi-config` → Interface Options → I2C → Enable
    - Verify I2C devices: `sudo i2cdetect -y 1`
+   - Ensure SPI is enabled for PMS5003: `sudo raspi-config` → Interface Options → SPI → Enable
 
 2. **Database Connection Errors**
    - Verify MySQL service is running: `sudo systemctl status mariadb`
-   - Check credentials in configuration
+   - Check credentials in `.env` file
    - Ensure database and user exist
+   - Test connection manually: `mysql -u sensor_user -p sensor_data`
 
 3. **Permission Errors**
    - Run with appropriate user permissions
    - Check file permissions: `ls -la sensor_logger.log`
+   - Ensure the user running the script has write access to the directory
 
 4. **Grafana Not Accessible**
    - Check Grafana service: `sudo systemctl status grafana-server`
    - Verify firewall settings: `sudo ufw allow 3000`
+   - Check if Grafana is listening: `ss -tulnp | grep 3000`
+
+5. **Python Module Import Errors**
+   - Ensure you're using the virtual environment: `source venv/bin/activate`
+   - Reinstall dependencies: `pip install -r requirements.txt`
+   - Check Python version: `python3 --version`
 
 ### Log Files
 
-- Application logs: `sensor_logger.log`
+- Application logs: `sensor_logger.log` (rotated automatically)
 - System logs: `journalctl -u sensor-logger.service`
+- MySQL logs: `/var/log/mysql/error.log`
+
+### Debug Mode
+
+To enable verbose logging, set `LOG_LEVEL=DEBUG` in your `.env` file and restart the logger.
+
+## Project Structure
+
+```
+Pi-zero-2-w-envirohat-air/
+├── logger.py              # Main sensor logger script
+├── Grafana.sh             # Grafana installation script
+├── connectDB.sql          # Database schema SQL
+├── requirements.txt       # Python dependencies
+├── Readme.md              # This documentation
+├── LICENSE                # GPLv3 License
+├── .env.example           # Example environment configuration
+├── .gitignore             # Git ignore patterns
+└── sensor_logger.log      # Application log file (generated)
+```
 
 ## Contributing
 
@@ -321,7 +381,7 @@ This project is licensed under the GPLv3 License - see the [LICENSE](LICENSE) fi
 
 ## Acknowledgments
 
-- Pimoroni for selling me the Enviro+ Air HAT
+- Pimoroni for the Enviro+ Air HAT
 - Raspberry Pi Foundation
 - Grafana Labs
 - MySQL/MariaDB communities

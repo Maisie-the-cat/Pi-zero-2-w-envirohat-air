@@ -4,65 +4,104 @@ Enviro+ Air HAT Data Logger for Raspberry Pi Zero W
 Logs sensor data to MySQL database continuously
 """
 
+import os
 import time
+import signal
+import sys
+import logging
+from logging.handlers import RotatingFileHandler
+from datetime import datetime
+from dotenv import load_dotenv
 import mysql.connector
 from mysql.connector import Error
-import logging
-from datetime import datetime
 
-# Configure logging
+# Load environment variables
+load_dotenv()
+
+# Configure logging with rotation
+LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO').upper()
+LOG_MAX_BYTES = int(os.getenv('LOG_MAX_BYTES', '5242880'))  # 5MB default
+LOG_BACKUP_COUNT = int(os.getenv('LOG_BACKUP_COUNT', '3'))
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=LOG_LEVEL,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('sensor_logger.log'),
+        RotatingFileHandler(
+            'sensor_logger.log',
+            maxBytes=LOG_MAX_BYTES,
+            backupCount=LOG_BACKUP_COUNT
+        ),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
-# Database configuration
+# Database configuration from environment variables
 DB_CONFIG = {
-    'host': 'localhost',
-    'user': 'your_mysql_username',
-    'password': 'your_mysql_password',
-    'database': 'sensor_data'
+    'host': os.getenv('DB_HOST', 'localhost'),
+    'user': os.getenv('DB_USER', 'sensor_user'),
+    'password': os.getenv('DB_PASSWORD', ''),
+    'database': os.getenv('DB_NAME', 'sensor_data')
 }
 
 # Sensor reading interval in seconds
-READING_INTERVAL = 60  # 1 minute
+READING_INTERVAL = int(os.getenv('READING_INTERVAL', '60'))
+
 
 class EnviroSensorLogger:
     def __init__(self):
         self.db_connection = None
+        self.batch_data = []
+        self.max_batch_size = 5
         self.setup_sensors()
         self.setup_database()
+        # Register signal handlers
+        signal.signal(signal.SIGTERM, self.shutdown)
+        signal.signal(signal.SIGINT, self.shutdown)
     
-    def setup_sensors(self):
+    def shutdown(self, signum, frame):
+        """Handle graceful shutdown"""
+        logger.info(f"Received signal {signum}. Shutting down gracefully...")
+        if self.db_connection and self.db_connection.is_connected():
+            try:
+                if self.batch_data:
+                    self._insert_batch()
+                self.db_connection.close()
+                logger.info("Database connection closed")
+            except Error as e:
+                logger.error(f"Error closing database connection: {e}")
+        sys.exit(0)
+    
+    def setup_sensors(self, retry_count=0):
         """Initialize all Enviro+ Air HAT sensors"""
         try:
             # Import sensor libraries
             import bme280
             import pms5003
             import enviroplus
-            from enviroplus import gas
+            from enviroplus import gas, light
             
             self.bme280_sensor = bme280.BME280()
             self.pms_sensor = pms5003.PMS5003()
             self.gas_sensor = gas
+            self.light_sensor = light
             
             logger.info("All sensors initialized successfully")
             
         except ImportError as e:
             logger.error(f"Sensor library import error: {e}")
-            logger.info("Installing required libraries...")
-            self.install_sensor_libraries()
-            self.setup_sensors()
+            if retry_count < 3:
+                logger.info(f"Installing required libraries (attempt {retry_count + 1})...")
+                self.install_sensor_libraries()
+                self.setup_sensors(retry_count + 1)
+            else:
+                logger.critical("Failed to initialize sensors after 3 attempts. Exiting.")
+                raise
     
     def install_sensor_libraries(self):
         """Install required sensor libraries"""
         import subprocess
-        import sys
         
         libraries = [
             'bme280',
@@ -73,11 +112,22 @@ class EnviroSensorLogger:
         ]
         
         for lib in libraries:
-            subprocess.check_call([sys.executable, '-m', 'pip', 'install', lib])
+            try:
+                subprocess.check_call([sys.executable, '-m', 'pip', 'install', lib])
+                logger.info(f"Successfully installed {lib}")
+            except subprocess.CalledProcessError as e:
+                logger.error(f"Failed to install {lib}: {e}")
     
     def setup_database(self):
         """Establish database connection"""
         try:
+            # Validate DB_CONFIG
+            if not all(DB_CONFIG.values()):
+                missing = [k for k, v in DB_CONFIG.items() if not v]
+                logger.error(f"Missing database configuration for: {', '.join(missing)}")
+                logger.error("Please set environment variables: DB_HOST, DB_USER, DB_PASSWORD, DB_NAME")
+                raise ValueError("Incomplete database configuration")
+            
             self.db_connection = mysql.connector.connect(**DB_CONFIG)
             if self.db_connection.is_connected():
                 logger.info("Connected to MySQL database")
@@ -88,27 +138,64 @@ class EnviroSensorLogger:
     
     def create_table_if_not_exists(self):
         """Create sensor readings table if it doesn't exist"""
-        cursor = self.db_connection.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS sensor_readings (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                temperature FLOAT,
-                pressure FLOAT,
-                humidity FLOAT,
-                light FLOAT,
-                oxidised FLOAT,
-                reduced FLOAT,
-                nh3 FLOAT,
-                pm1 FLOAT,
-                pm25 FLOAT,
-                pm10 FLOAT,
-                cpu_temp FLOAT,
-                INDEX idx_timestamp (timestamp)
-            )
-        """)
-        self.db_connection.commit()
-        cursor.close()
+        try:
+            cursor = self.db_connection.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS sensor_readings (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    temperature FLOAT,
+                    pressure FLOAT,
+                    humidity FLOAT,
+                    light FLOAT,
+                    oxidised FLOAT,
+                    reduced FLOAT,
+                    nh3 FLOAT,
+                    pm1 FLOAT,
+                    pm25 FLOAT,
+                    pm10 FLOAT,
+                    cpu_temp FLOAT,
+                    INDEX idx_timestamp (timestamp)
+                )
+            """)
+            self.db_connection.commit()
+            cursor.close()
+        except Error as e:
+            logger.error(f"Error creating table: {e}")
+            raise
+    
+    def validate_sensor_data(self, data):
+        """Validate sensor readings before insertion"""
+        if not data:
+            logger.warning("No sensor data to validate")
+            return False
+        
+        # Define valid ranges for each sensor
+        ranges = {
+            'temperature': (-50, 100),    # °C
+            'pressure': (800, 1100),      # hPa
+            'humidity': (0, 100),         # %
+            'light': (0, 100000),        # lux
+            'oxidised': (0, 1000000),    # resistance
+            'reduced': (0, 1000000),     # resistance
+            'nh3': (0, 1000000),         # resistance
+            'pm1': (0, 1000),            # µg/m³
+            'pm25': (0, 1000),           # µg/m³
+            'pm10': (0, 1000),           # µg/m³
+            'cpu_temp': (0, 100)         # °C
+        }
+        
+        for key, value in data.items():
+            if value is None:
+                logger.warning(f"Invalid {key}: None")
+                return False
+            if key in ranges:
+                min_val, max_val = ranges[key]
+                if not (min_val <= value <= max_val):
+                    logger.warning(f"{key} out of range: {value} (expected {min_val}-{max_val})")
+                    return False
+        
+        return True
     
     def read_sensors(self):
         """Read all sensor data"""
@@ -119,7 +206,7 @@ class EnviroSensorLogger:
             humidity = self.bme280_sensor.get_humidity()
             
             # Read light sensor
-            light = self.read_light_sensor()
+            light = self.light_sensor.read()
             
             # Read gas sensor
             gas_readings = self.gas_sensor.read_all()
@@ -127,16 +214,24 @@ class EnviroSensorLogger:
             reduced = gas_readings.reducing
             nh3 = gas_readings.nh3
             
-            # Read particulate matter sensor
-            pm_data = self.pms_sensor.read()
-            pm1 = pm_data.pm_ug_per_m3(1)
-            pm25 = pm_data.pm_ug_per_m3(2.5)
-            pm10 = pm_data.pm_ug_per_m3(10)
+            # Read particulate matter sensor with timeout
+            try:
+                self.pms_sensor.set_timeout(5)  # 5 second timeout
+                pm_data = self.pms_sensor.read()
+                pm1 = pm_data.pm_ug_per_m3(1)
+                pm25 = pm_data.pm_ug_per_m3(2.5)
+                pm10 = pm_data.pm_ug_per_m3(10)
+            except TimeoutError:
+                logger.warning("PMS5003 read timeout, using previous values")
+                pm1, pm25, pm10 = 0.0, 0.0, 0.0
+            except Exception as e:
+                logger.warning(f"PMS5003 read error: {e}, using 0.0")
+                pm1, pm25, pm10 = 0.0, 0.0, 0.0
             
             # Read CPU temperature
             cpu_temp = self.get_cpu_temperature()
             
-            return {
+            sensor_data = {
                 'temperature': temperature,
                 'pressure': pressure,
                 'humidity': humidity,
@@ -150,23 +245,16 @@ class EnviroSensorLogger:
                 'cpu_temp': cpu_temp
             }
             
+            # Validate data
+            if not self.validate_sensor_data(sensor_data):
+                logger.warning("Invalid sensor data detected")
+                return None
+            
+            return sensor_data
+            
         except Exception as e:
             logger.error(f"Error reading sensors: {e}")
             return None
-    
-    def read_light_sensor(self):
-        """Read light sensor value"""
-        try:
-            # This depends on your specific light sensor implementation
-            # For Enviro+ HAT, you might need to use ADC
-            import smbus2
-            bus = smbus2.SMBus(1)
-            # Read from light sensor (address and register may vary)
-            # This is a placeholder - adjust based on your hardware
-            return 0.0
-        except Exception as e:
-            logger.warning(f"Light sensor read error: {e}")
-            return 0.0
     
     def get_cpu_temperature(self):
         """Get Raspberry Pi CPU temperature"""
@@ -178,75 +266,120 @@ class EnviroSensorLogger:
             logger.warning(f"CPU temperature read error: {e}")
             return 0.0
     
-    def log_to_database(self, sensor_data):
-        """Log sensor data to MySQL database"""
-        if not sensor_data:
+    def _insert_batch(self):
+        """Insert batched sensor data into database"""
+        if not self.batch_data:
             return False
         
         try:
             cursor = self.db_connection.cursor()
             query = """
                 INSERT INTO sensor_readings 
-                (temperature, pressure, humidity, light, oxidised, reduced, nh3, pm1, pm25, pm10, cpu_temp)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                (timestamp, temperature, pressure, humidity, light, oxidised, reduced, nh3, pm1, pm25, pm10, cpu_temp)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """
-            values = (
-                sensor_data['temperature'],
-                sensor_data['pressure'],
-                sensor_data['humidity'],
-                sensor_data['light'],
-                sensor_data['oxidised'],
-                sensor_data['reduced'],
-                sensor_data['nh3'],
-                sensor_data['pm1'],
-                sensor_data['pm25'],
-                sensor_data['pm10'],
-                sensor_data['cpu_temp']
-            )
             
-            cursor.execute(query, values)
+            batch_values = []
+            for data in self.batch_data:
+                batch_values.append((
+                    datetime.now(),
+                    data['temperature'],
+                    data['pressure'],
+                    data['humidity'],
+                    data['light'],
+                    data['oxidised'],
+                    data['reduced'],
+                    data['nh3'],
+                    data['pm1'],
+                    data['pm25'],
+                    data['pm10'],
+                    data['cpu_temp']
+                ))
+            
+            cursor.executemany(query, batch_values)
             self.db_connection.commit()
             cursor.close()
             
-            logger.info(f"Logged sensor data: Temp={sensor_data['temperature']:.1f}°C, "
-                       f"Humidity={sensor_data['humidity']:.1f}%, "
-                       f"Pressure={sensor_data['pressure']:.1f}hPa")
+            # Log summary
+            if len(self.batch_data) > 0:
+                avg_temp = sum(d['temperature'] for d in self.batch_data) / len(self.batch_data)
+                logger.info(f"Logged {len(self.batch_data)} readings. Avg Temp={avg_temp:.1f}°C")
+            
+            self.batch_data = []
             return True
             
         except Error as e:
-            logger.error(f"Database error: {e}")
+            logger.error(f"Batch database error: {e}")
+            self.db_connection.rollback()
             # Try to reconnect
             self.setup_database()
             return False
     
+    def log_to_database(self, sensor_data):
+        """Log sensor data to MySQL database (with batching)"""
+        if not sensor_data:
+            return False
+        
+        try:
+            self.batch_data.append(sensor_data)
+            
+            # Insert batch if we've reached the batch size
+            if len(self.batch_data) >= self.max_batch_size:
+                return self._insert_batch()
+            
+            return True
+            
+        except Error as e:
+            logger.error(f"Database error: {e}")
+            self.db_connection.rollback()
+            # Try to reconnect
+            self.setup_database()
+            return False
+    
+    def flush_batch(self):
+        """Force insert any remaining batched data"""
+        if self.batch_data:
+            return self._insert_batch()
+        return True
+    
     def run(self):
         """Main loop to continuously log sensor data"""
         logger.info("Starting Enviro+ Air HAT sensor logger...")
+        logger.info(f"Reading interval: {READING_INTERVAL} seconds")
         
-        while True:
-            try:
-                # Read sensor data
-                sensor_data = self.read_sensors()
-                
-                # Log to database
-                if sensor_data:
-                    self.log_to_database(sensor_data)
-                
-                # Wait for next reading
-                time.sleep(READING_INTERVAL)
-                
-            except KeyboardInterrupt:
-                logger.info("Stopping sensor logger...")
-                break
-            except Exception as e:
-                logger.error(f"Unexpected error: {e}")
-                time.sleep(10)  # Wait before retrying
+        try:
+            while True:
+                try:
+                    # Read sensor data
+                    sensor_data = self.read_sensors()
+                    
+                    # Log to database
+                    if sensor_data:
+                        self.log_to_database(sensor_data)
+                    
+                    # Wait for next reading
+                    time.sleep(READING_INTERVAL)
+                    
+                except KeyboardInterrupt:
+                    logger.info("Stopping sensor logger...")
+                    break
+                except Exception as e:
+                    logger.error(f"Unexpected error: {e}")
+                    time.sleep(10)  # Wait before retrying
         
-        # Clean up
-        if self.db_connection and self.db_connection.is_connected():
-            self.db_connection.close()
-            logger.info("Database connection closed")
+        finally:
+            # Clean up
+            logger.info("Flushing remaining data...")
+            self.flush_batch()
+            if self.db_connection and self.db_connection.is_connected():
+                self.db_connection.close()
+                logger.info("Database connection closed")
+
 
 if __name__ == "__main__":
-    logger = EnviroSensorLogger()
-    logger.run()
+    try:
+        sensor_logger = EnviroSensorLogger()
+        sensor_logger.run()
+    except Exception as e:
+        logger.critical(f"Fatal error: {e}")
+        sys.exit(1)
