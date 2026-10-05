@@ -1,27 +1,28 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 echo "=========================================="
 echo "Running Tests for Enviro+ Air HAT Logger"
 echo "=========================================="
 echo ""
 
-# Check if pytest is installed
-if ! command -v pytest &> /dev/null; then
-    echo "pytest not found. Installing..."
-    pip install pytest
+# Use the active Python environment and never install packages at runtime.
+PYTHON="${PYTHON:-python3}"
+if ! command -v "$PYTHON" &> /dev/null; then
+    echo "Python interpreter not found: $PYTHON" >&2
+    exit 1
+fi
+if ! "$PYTHON" -c 'import pytest' &> /dev/null; then
+    echo "pytest is not installed for $PYTHON; install the test dependencies before running this script" >&2
+    exit 1
 fi
 
 # Run tests
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR/.."
 
-echo "Running configuration tests..."
-pytest tests/test_config.py -v --tb=short
-
-echo ""
-echo "Running database tests..."
-pytest tests/test_database.py -v --tb=short
+echo "Running all tests..."
+"$PYTHON" -m pytest tests/ -v --tb=short
 
 echo ""
 echo "=========================================="

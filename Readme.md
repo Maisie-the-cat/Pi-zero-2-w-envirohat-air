@@ -6,6 +6,7 @@ A complete solution for continuously logging environmental sensor data from the 
 
 - [Overview](#overview)
 - [Features](#features)
+- [Security and Testing](#security-and-testing)
 - [Hardware Requirements](#hardware-requirements)
 - [Software Requirements](#software-requirements)
 - [Installation](#installation)
@@ -38,6 +39,44 @@ This project provides a Python-based data logger that continuously reads environ
 - **Configuration Management**: Environment variables for secure credential management
 - **Graceful Shutdown**: Proper cleanup on SIGTERM/SIGINT signals
 
+## Security and Testing
+
+### Security hardening
+
+Recent security hardening changes include:
+
+- **Local-only metrics**: The Prometheus endpoint binds to `127.0.0.1` and is not exposed on all network interfaces by default.
+- **No runtime package installation**: The logger never runs `pip install` while starting. Install the pinned dependencies during deployment instead.
+- **Pinned dependencies**: `requirements.txt` uses exact versions for the database, metrics, configuration, and sensor libraries. The `bme280` dependency is pinned to the published `0.7` release.
+- **Safer database setup**: `setup.sh` validates database identifiers, protects temporary credential files, avoids command-line password exposure, and grants the logger only the permissions it needs.
+- **Safer schema defaults**: `connectDB.sql` uses explicit InnoDB tables and indexes suited to timestamp-based sensor queries.
+
+### Automated security checks
+
+GitHub Actions runs `.github/workflows/security.yml` on every push, pull request, and manual dispatch. The workflow performs:
+
+- Bandit scanning of the production logger code.
+- `pip-audit` checks against every pinned dependency.
+- Gitleaks scanning for credentials and private keys across the repository history.
+
+### Test suite
+
+Run the complete local suite with:
+
+```bash
+./tests/run_tests.sh
+```
+
+The suite includes configuration and security regression tests plus database unit tests that run without MySQL or Raspberry Pi hardware. Database coverage includes:
+
+- Schema creation and connection cleanup
+- Parameterized batch inserts
+- Batch clearing after successful writes
+- Rollback and reconnection after database errors
+- Automatic flushing when the configured batch size is reached
+
+The database tests use mocks for the connection and cursor, so live database integration should still be validated separately on a configured Raspberry Pi deployment.
+
 ## Hardware Requirements
 
 - Raspberry Pi Zero W
@@ -49,7 +88,7 @@ This project provides a Python-based data logger that continuously reads environ
 ## Software Requirements
 
 - Raspberry Pi OS (32-bit) with desktop
-- Python 3.7+
+- Python 3.10+
 - MySQL/MariaDB Server
 - Grafana (optional, for visualization)
 - Prometheus (optional, for metrics collection)
@@ -130,7 +169,8 @@ CREATE DATABASE sensor_data;
 
 -- Create user and grant privileges
 CREATE USER 'sensor_user'@'localhost' IDENTIFIED BY 'your_secure_password';
-GRANT ALL PRIVILEGES ON sensor_data.* TO 'sensor_user'@'localhost';
+GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, INDEX, ALTER
+    ON sensor_data.* TO 'sensor_user'@'localhost';
 FLUSH PRIVILEGES;
 ```
 
@@ -292,7 +332,7 @@ Set `ENABLE_PROMETHEUS=true` in your `.env` file or environment:
 ENABLE_PROMETHEUS=true python3 logger.py
 ```
 
-The metrics server will start on port 8000 by default (configurable via `PROMETHEUS_PORT`).
+The metrics server binds to `127.0.0.1` on port 8000 by default (the port is configurable via `PROMETHEUS_PORT`). Prometheus should scrape it locally on the Raspberry Pi rather than exposing port 8000 to untrusted networks.
 
 ### Available Metrics
 
