@@ -2,6 +2,23 @@
 
 This document summarizes all the changes made to the Pi-zero-2-w-envirohat-air repository to fix errors and implement optimizations.
 
+## [1.1.1] - 2026-10-05
+
+### Security hardening
+
+- Removed runtime package installation from `logger.py`; missing sensor dependencies now fail safely.
+- Bound Prometheus metrics to loopback (`127.0.0.1`) instead of all network interfaces.
+- Reworked database setup to avoid unsafe SQL interpolation, protect temporary credential files, and use least-privilege grants.
+- Added parameterized database-write coverage and pinned all declared Python dependencies.
+- Pinned GitHub Actions to immutable commit SHAs and restricted CI scanner installation to binary wheels.
+- Added weekly Dependabot updates and scheduled Bandit, pip-audit, and Gitleaks checks.
+
+### Verification
+
+- Full test suite: 16 tests passed.
+- Bandit and pip-audit checks passed with no known vulnerabilities.
+- SonarCloud Security Quality Gate passed.
+
 ## 📁 Files Modified
 
 ### 1. `logger.py` - Main Application File
@@ -148,6 +165,6 @@ tests/test_config.py::TestLoggerInitialization::test_logger_creation_with_promet
 
 ## 📝 Version Information
 
-- **Previous version**: 1.0.0
-- **New version**: 1.1.0
-- **Changes**: All fixes and optimizations documented above
+- **Previous version**: 1.1.0
+- **New version**: 1.1.1
+- **Changes**: Security hardening and automated dependency auditing documented above

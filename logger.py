@@ -205,7 +205,7 @@ class EnviroSensorLogger:
 
         # Set application info
         APP_INFO.info({
-            'version': '1.1.0',
+            'version': '1.1.1',
             'use_async': str(use_async),
             'enable_prometheus': str(enable_prometheus)
         })
