@@ -124,7 +124,7 @@ fi
 echo
 echo "Step 4: Installing Python dependencies..."
 source "$SCRIPT_DIR/venv/bin/activate"
-python -m pip install --upgrade pip -q
+python -m pip install --upgrade --only-binary=:all: pip -q
 python -m pip install -r "$SCRIPT_DIR/requirements.txt" -q
 
 # Step 5: Create .env file
