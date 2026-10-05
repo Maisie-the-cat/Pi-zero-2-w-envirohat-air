@@ -31,6 +31,7 @@ DEFAULT_LOG_LEVEL = 'INFO'
 DEFAULT_LOG_MAX_BYTES = 5242880  # 5MB
 DEFAULT_LOG_BACKUP_COUNT = 3
 DEFAULT_PROMETHEUS_PORT = 8000
+PROMETHEUS_BIND_ADDRESS = '127.0.0.1'
 
 # Sensor value constants
 DEFAULT_SENSOR_VALUE = 0.0
@@ -171,7 +172,7 @@ APP_INFO = Info('sensor_logger_info', 'Sensor Logger Application Information')
 HEALTH_CHECK = Gauge('sensor_logger_health', 'Application health status (1=healthy, 0=unhealthy)')
 
 
-def is_port_available(port, host='0.0.0.0'):
+def is_port_available(port, host='127.0.0.1'):
     """Check if a port is available"""
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -251,7 +252,7 @@ class EnviroSensorLogger:
         except Error as e:
             logger.error(f"Error closing database connections: {e}")
 
-    def setup_sensors(self, retry_count=0):
+    def setup_sensors(self):
         """Initialize all Enviro+ Air HAT sensors"""
         if self.sensors_initialized:
             return
@@ -295,35 +296,9 @@ class EnviroSensorLogger:
             logger.info(LOG_SENSORS_INITIALIZED)
 
         except ImportError as e:
-            logger.error(f"Sensor library import error: {e}")
-            if retry_count < SENSOR_RETRY_ATTEMPTS:
-                logger.info(f"Installing required libraries (attempt {retry_count + 1})...")
-                self.install_sensor_libraries()
-                self.setup_sensors(retry_count + 1)
-            else:
-                logger.critical("Failed to initialize sensors after 3 attempts. Exiting.")
-                HEALTH_CHECK.set(0)
-                raise SensorInitializationError("Failed to initialize sensors")
-
-    def install_sensor_libraries(self):
-        """Install required sensor libraries"""
-        import subprocess
-
-        libraries = [
-            'bme280',
-            'pms5003',
-            'enviroplus',
-            'smbus2',
-            'RPi.GPIO'
-        ]
-
-        for lib in libraries:
-            try:
-                subprocess.check_call([sys.executable, '-m', 'pip', 'install', lib], 
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                logger.info(f"Successfully installed {lib}")
-            except subprocess.CalledProcessError as e:
-                logger.error(f"Failed to install {lib}: {e}")
+            logger.error("Sensor libraries are unavailable; install requirements.txt before starting: %s", e)
+            HEALTH_CHECK.set(0)
+            raise SensorInitializationError("Required sensor libraries are not installed") from e
 
     def setup_database(self, retry_count=0):
         """Establish database connection with pooling and retry logic"""
@@ -646,7 +621,7 @@ class EnviroSensorLogger:
                     self.enable_prometheus = False
             
             if self.enable_prometheus:
-                start_http_server(prometheus_port)
+                start_http_server(prometheus_port, addr=PROMETHEUS_BIND_ADDRESS)
                 logger.info(f"{LOG_STARTING_PROMETHEUS} on port {prometheus_port}")
 
         self.running = True

@@ -15,6 +15,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 class TestPortAvailability:
     """Test port availability checking"""
+
+    def test_is_port_available_defaults_to_loopback(self):
+        """Port checks should not bind a socket on every network interface"""
+        import logger as logger_module
+
+        socket_instance = MagicMock()
+        socket_instance.__enter__.return_value = socket_instance
+        with patch.object(logger_module.socket, 'socket', return_value=socket_instance):
+            assert logger_module.is_port_available(8000)
+
+        socket_instance.bind.assert_called_once_with(('127.0.0.1', 8000))
     
     def test_is_port_available_used_port(self):
         """Test that a used port returns False"""
@@ -157,6 +168,29 @@ class TestLoggerInitialization:
         assert logger.use_async == False
         assert logger.enable_prometheus == True
         assert logger.running == False
+
+    def test_prometheus_server_binds_to_loopback(self):
+        """Prometheus must not be exposed on all network interfaces by default"""
+        from logger import EnviroSensorLogger
+
+        sensor_logger = EnviroSensorLogger(use_async=False, enable_prometheus=True)
+        with patch('logger.start_http_server') as start_server:
+            with patch.object(sensor_logger, '_run_sync'):
+                sensor_logger.run()
+
+        start_server.assert_called_once_with(8000, addr='127.0.0.1')
+
+    def test_missing_sensor_libraries_do_not_trigger_runtime_pip_install(self):
+        """Missing dependencies should fail safely instead of installing at runtime"""
+        import subprocess
+        from logger import EnviroSensorLogger, SensorInitializationError
+
+        sensor_logger = EnviroSensorLogger(use_async=False, enable_prometheus=False)
+        with patch.object(subprocess, 'check_call') as pip_install:
+            with pytest.raises(SensorInitializationError):
+                sensor_logger.setup_sensors()
+
+        pip_install.assert_not_called()
 
 
 if __name__ == '__main__':

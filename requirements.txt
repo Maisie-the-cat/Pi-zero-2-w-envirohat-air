@@ -1,15 +1,15 @@
 # Core dependencies
-mysql-connector-python>=8.0.0
-asyncmy>=0.2.0
-python-dotenv>=1.0.0
-prometheus-client>=0.17.0
+mysql-connector-python==26.7.0
+asyncmy==0.2.15
+python-dotenv==1.2.4
+prometheus-client==0.26.0
 
 # Sensor libraries for Enviro+ Air HAT
-bme280>=1.0.0
-pms5003>=1.0.0
-enviroplus>=1.0.0
-smbus2>=0.4.0
-RPi.GPIO>=0.7.0
+bme280==0.7
+pms5003==1.0.1
+enviroplus==1.0.2
+smbus2==0.6.1
+RPi.GPIO==0.7.1
 
 # Optional: For better async support
 # aiohttp>=3.8.0
