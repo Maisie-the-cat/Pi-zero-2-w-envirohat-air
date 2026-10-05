@@ -31,7 +31,9 @@ jobs:
           cache: pip
 
       - name: Install security scanners
-        run: python -m pip install --disable-pip-version-check --upgrade bandit pip-audit
+        run: >-
+          python -m pip install --disable-pip-version-check
+          bandit==1.9.4 pip-audit==2.10.1
 
       - name: Run Bandit
         run: bandit -r logger.py -q
