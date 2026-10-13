@@ -108,7 +108,7 @@ sudo apt-get upgrade -y -qq
 # Step 2: Install dependencies
 echo
 echo "Step 2: Installing system dependencies..."
-sudo apt-get install -y -qq python3 python3-pip python3-venv python3-dev libmysqlclient-dev
+sudo apt-get install -y -qq python3 python3-pip python3-venv python3-dev
 
 # Step 3: Create virtual environment
 echo
@@ -182,7 +182,12 @@ FLUSH PRIVILEGES;
 SQL
 
     echo "Creating database and user..."
-    sudo mysql -u root -p < "$ROOT_SQL_FILE"
+    # Try socket-based mysql (works when root uses socket auth). Fall back to prompting.
+    if sudo mysql --help >/dev/null 2>&1; then
+        sudo mysql < "$ROOT_SQL_FILE"
+    else
+        sudo mysql -u root -p < "$ROOT_SQL_FILE"
+    fi
 
     # Update .env without sed interpolation. Values are passed as data to
     # Python, so quotes, dollar signs, backslashes, and ampersands are safe.
