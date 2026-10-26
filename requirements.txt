@@ -1,6 +1,6 @@
 # Core dependencies
 mysql-connector-python==26.7.0
-asyncmy==0.2.15
+asyncmy==0.2.17
 python-dotenv==1.2.4
 prometheus-client==0.26.0
 
