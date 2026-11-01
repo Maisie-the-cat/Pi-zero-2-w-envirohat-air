@@ -12,11 +12,30 @@ import sys
 import logging
 import asyncio
 import socket
+import threading
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
 from dotenv import load_dotenv
 from prometheus_client import start_http_server, Gauge, Counter, Info
 from mysql.connector import pooling, Error
+
+
+def _get_int_env(name, default):
+    """Safely parse integer environment variables with a fallback default."""
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    try:
+        return int(raw_value)
+    except (TypeError, ValueError):
+        logging.getLogger(__name__).warning(
+            "Environment variable %s=%r is not a valid integer; using default %s",
+            name,
+            raw_value,
+            default,
+        )
+        return default
+
 
 # Load environment variables
 load_dotenv()
@@ -68,8 +87,8 @@ LOG_STARTING_PROMETHEUS = "Starting Prometheus metrics server"
 
 # Configure logging with rotation
 LOG_LEVEL = os.getenv('LOG_LEVEL', DEFAULT_LOG_LEVEL).upper()
-LOG_MAX_BYTES = int(os.getenv('LOG_MAX_BYTES', str(DEFAULT_LOG_MAX_BYTES)))
-LOG_BACKUP_COUNT = int(os.getenv('LOG_BACKUP_COUNT', str(DEFAULT_LOG_BACKUP_COUNT)))
+LOG_MAX_BYTES = _get_int_env('LOG_MAX_BYTES', DEFAULT_LOG_MAX_BYTES)
+LOG_BACKUP_COUNT = _get_int_env('LOG_BACKUP_COUNT', DEFAULT_LOG_BACKUP_COUNT)
 
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -110,24 +129,32 @@ def get_db_config():
         'password': os.getenv('DB_PASSWORD', ''),
         'database': os.getenv('DB_NAME', DEFAULT_DB_NAME),
         'pool_name': CONNECTION_POOL_NAME,
-        'pool_size': int(os.getenv('CONNECTION_POOL_SIZE', str(CONNECTION_POOL_SIZE))),
+        'pool_size': _get_int_env('CONNECTION_POOL_SIZE', CONNECTION_POOL_SIZE),
         'pool_reset_session': True
     }
-    
+
     # Validate required fields (password can be empty for password-less auth)
     required_fields = ['host', 'user', 'database']
     missing = [field for field in required_fields if not config[field]]
-    
+
     if missing:
         logger.error(f"Missing database configuration for: {', '.join(missing)}")
         logger.error("Please set environment variables: DB_HOST, DB_USER, DB_NAME")
         raise DatabaseConfigError(f"Missing required database configuration: {', '.join(missing)}")
-    
+
+    if config['pool_size'] <= 0:
+        logger.warning(
+            "Invalid connection pool size %s; using default %s",
+            config['pool_size'],
+            CONNECTION_POOL_SIZE,
+        )
+        config['pool_size'] = CONNECTION_POOL_SIZE
+
     return config
 
 
 # Sensor reading interval in seconds
-READING_INTERVAL = int(os.getenv('READING_INTERVAL', str(DEFAULT_READING_INTERVAL)))
+READING_INTERVAL = _get_int_env('READING_INTERVAL', DEFAULT_READING_INTERVAL)
 
 # Prometheus metrics
 SENSOR_READINGS_TOTAL = Counter(
@@ -196,7 +223,7 @@ class EnviroSensorLogger:
         self.db_connection = None
         self.db_pool = None
         self.batch_data = []
-        self.max_batch_size = int(os.getenv('BATCH_SIZE', str(DEFAULT_BATCH_SIZE)))
+        self.max_batch_size = _get_int_env('BATCH_SIZE', DEFAULT_BATCH_SIZE)
         self.use_async = use_async
         self.enable_prometheus = enable_prometheus
         self.running = False
@@ -213,32 +240,37 @@ class EnviroSensorLogger:
         # Initialize health check
         HEALTH_CHECK.set(1)
 
-        # Register signal handlers
-        signal.signal(signal.SIGTERM, self.shutdown)
-        signal.signal(signal.SIGINT, self.shutdown)
+        # Register signal handlers safely. Some test environments run code outside the main thread.
+        if threading.current_thread() is threading.main_thread():
+            try:
+                signal.signal(signal.SIGTERM, self.shutdown)
+                signal.signal(signal.SIGINT, self.shutdown)
+            except (ValueError, AttributeError):
+                logger.debug("Unable to register process signal handlers in this environment")
 
-    def shutdown(self, signum, frame):
+    def shutdown(self, signum=None, frame=None):
         """Handle graceful shutdown"""
         logger.info(f"Received signal {signum}. Shutting down gracefully...")
         HEALTH_CHECK.set(0)
         self.running = False
-        
+
         # Flush any remaining data
         if self.batch_data:
             logger.info(LOG_FLUSHING_DATA)
             try:
-                if self.use_async and self.async_loop:
+                if self.use_async and self.async_loop and not self.async_loop.is_closed():
                     asyncio.run_coroutine_threadsafe(self.flush_batch_async(), self.async_loop)
                 else:
                     self.flush_batch()
             except Exception as e:
                 logger.error(f"Error flushing batch on shutdown: {e}")
-        
+
         # Close database connections
         self.close_database_connections()
-        
+
         logger.info(LOG_DB_CLOSED)
-        sys.exit(0)
+        if signum is not None:
+            raise KeyboardInterrupt
 
     def close_database_connections(self):
         """Close all database connections safely"""
@@ -256,7 +288,7 @@ class EnviroSensorLogger:
         """Initialize all Enviro+ Air HAT sensors"""
         if self.sensors_initialized:
             return
-            
+
         try:
             # Import sensor libraries with fallbacks
             try:
@@ -330,7 +362,7 @@ class EnviroSensorLogger:
         except Error as e:
             logger.error(f"Database connection error (attempt {retry_count + 1}): {e}")
             DB_CONNECTION_RETRIES.inc()
-            
+
             if retry_count < DB_RETRY_ATTEMPTS:
                 delay = DB_RETRY_DELAY * (2 ** retry_count)  # Exponential backoff
                 logger.info(f"Retrying database connection in {delay} seconds...")
@@ -607,8 +639,8 @@ class EnviroSensorLogger:
 
         # Start Prometheus server if enabled
         if self.enable_prometheus:
-            prometheus_port = int(os.getenv('PROMETHEUS_PORT', str(DEFAULT_PROMETHEUS_PORT)))
-            
+            prometheus_port = _get_int_env('PROMETHEUS_PORT', DEFAULT_PROMETHEUS_PORT)
+
             # Check if port is available, find alternative if not
             if not is_port_available(prometheus_port):
                 logger.warning(f"Port {prometheus_port} is not available, finding alternative...")
@@ -619,7 +651,7 @@ class EnviroSensorLogger:
                 else:
                     logger.error("No available port found for Prometheus, disabling metrics")
                     self.enable_prometheus = False
-            
+
             if self.enable_prometheus:
                 start_http_server(prometheus_port, addr=PROMETHEUS_BIND_ADDRESS)
                 logger.info(f"{LOG_STARTING_PROMETHEUS} on port {prometheus_port}")
@@ -695,7 +727,7 @@ class EnviroSensorLogger:
 
         self.async_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.async_loop)
-        
+
         try:
             self.async_loop.run_until_complete(async_loop())
         except KeyboardInterrupt:
@@ -708,8 +740,8 @@ class EnviroSensorLogger:
 
 def create_async_logger():
     """Factory function to create async logger with all features"""
-    use_async = os.getenv('USE_ASYNC', 'false').lower() == 'true'
-    enable_prometheus = os.getenv('ENABLE_PROMETHEUS', 'false').lower() == 'true'
+    use_async = os.getenv('USE_ASYNC', 'false').lower() in {'true', '1', 'yes', 'on'}
+    enable_prometheus = os.getenv('ENABLE_PROMETHEUS', 'false').lower() in {'true', '1', 'yes', 'on'}
     return EnviroSensorLogger(use_async=use_async, enable_prometheus=enable_prometheus)
 
 
@@ -719,7 +751,7 @@ if __name__ == "__main__":
         if not os.path.exists('.env'):
             logger.warning(".env file not found. Using environment variables or defaults.")
             logger.warning("Create a .env file from .env.example for configuration.")
-        
+
         sensor_logger = create_async_logger()
         sensor_logger.run()
     except Exception as e:
