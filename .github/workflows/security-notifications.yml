@@ -133,7 +133,6 @@ jobs:
 
             if (context.eventName === 'schedule' || context.eventName === 'workflow_dispatch') {
               const alerts = await github.paginate(
-                github.request,
                 'GET /repos/{owner}/{repo}/dependabot/alerts',
                 { owner, repo, state: 'open', per_page: 100 },
               );
