@@ -9,7 +9,7 @@ APT_KEYRING="/etc/apt/keyrings/grafana.asc"
 VENV_DIR="$SCRIPT_DIR/venv"
 
 # Check if running as root
-if [ "$EUID" -ne 0 ]; then
+if [[ "$EUID" -ne 0 ]]; then
     echo "This script requires root privileges. Please run with sudo."
     exit 1
 fi
@@ -25,11 +25,11 @@ install -d -m 0755 /etc/apt/keyrings
 
 # Add Grafana's official signing key to a dedicated keyring. APT verifies
 # package signatures against this keyring via the signed-by repository option.
-if [ ! -s "$APT_KEYRING" ]; then
+if [[ ! -s "$APT_KEYRING" ]]; then
     printf '%s\n' "Adding Grafana GPG key..."
     tmp_key="$(mktemp)"
     trap 'rm -f -- "$tmp_key"' EXIT
-    wget --https-only --timeout=30 --tries=3 --quiet \
+    wget --https-only --max-redirect=0 --timeout=30 --tries=3 --quiet \
         --output-document="$tmp_key" https://apt.grafana.com/gpg-full.key
     install -m 0644 "$tmp_key" "$APT_KEYRING"
     rm -f -- "$tmp_key"
@@ -62,18 +62,18 @@ fi
 
 # Install the pinned Python dependencies in the project virtual environment.
 printf '%s\n' "Installing Python dependencies..."
-if [ ! -f "$SCRIPT_DIR/requirements.txt" ]; then
+if [[ ! -f "$SCRIPT_DIR/requirements.txt" ]]; then
     printf '%s\n' "requirements.txt is required for a pinned installation." >&2
     exit 1
 fi
-if [ ! -d "$VENV_DIR" ]; then
+if [[ ! -d "$VENV_DIR" ]]; then
     python3 -m venv "$VENV_DIR"
 fi
 "$VENV_DIR/bin/python" -m pip install --upgrade --only-binary=:all: pip -q
 "$VENV_DIR/bin/python" -m pip install -r "$SCRIPT_DIR/requirements.txt" -q
 
 # Create .env file from example if it doesn't exist
-if [ -f "$SCRIPT_DIR/.env.example" ] && [ ! -f "$SCRIPT_DIR/.env" ]; then
+if [[ -f "$SCRIPT_DIR/.env.example" && ! -f "$SCRIPT_DIR/.env" ]]; then
     printf '%s\n' "Creating .env file from example..."
     cp "$SCRIPT_DIR/.env.example" "$SCRIPT_DIR/.env"
     chmod 600 "$SCRIPT_DIR/.env"
@@ -92,7 +92,7 @@ printf '%s\n' "Installation Complete!"
 printf '%s\n' "=========================================="
 printf '%s\n' ""
 printf '%s\n' "Grafana is now installed and running. Set a unique admin password on first login."
-printf 'Access Grafana at: http://%s:3000\n' "$(hostname -I | awk '{print $1}')"
+printf '%s\n' "Grafana listens on port 3000; expose it only through HTTPS or a trusted local network."
 printf '%s\n' ""
 printf '%s\n' "To start the sensor logger manually:"
 printf '  cd %s\n' "$SCRIPT_DIR"
