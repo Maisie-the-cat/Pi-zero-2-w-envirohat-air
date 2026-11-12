@@ -2,6 +2,14 @@
 
 This document summarizes all the changes made to the Pi-zero-2-w-envirohat-air repository to fix errors and implement optimizations.
 
+## Unreleased
+
+### Security hardening
+
+- Replaced the deprecated Grafana `apt-key` pipeline with a dedicated APT keyring and `signed-by` repository configuration.
+- Removed unpinned/root-level Python installation fallbacks from `Grafana.sh`; dependencies now install from the pinned requirements file inside the project virtual environment.
+- Tightened the repository Actions allowlist to the exact pinned Gitleaks action reference so the complete security workflow can start.
+
 ## [1.1.1] - 2026-10-05
 
 ### Security hardening
